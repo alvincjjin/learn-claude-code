@@ -44,13 +44,18 @@ SUBAGENT_SYSTEM = f"You are a coding subagent at {WORKDIR}. Complete the given t
 
 
 # -- Tool implementations shared by parent and child --
+# Both parent and subagent use the same tool implementations.
+# They share the same WORKDIR, so file operations affect the same filesystem.
+
 def safe_path(p: str) -> Path:
+    """Resolve relative path and ensure it stays within WORKDIR (security check)."""
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
         raise ValueError(f"Path escapes workspace: {p}")
     return path
 
 def run_bash(command: str) -> str:
+    """Execute a shell command with safety checks and 120s timeout."""
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(d in command for d in dangerous):
         return "Error: Dangerous command blocked"
@@ -63,6 +68,7 @@ def run_bash(command: str) -> str:
         return "Error: Timeout (120s)"
 
 def run_read(path: str, limit: int = None) -> str:
+    """Read file contents with optional line limit."""
     try:
         lines = safe_path(path).read_text().splitlines()
         if limit and limit < len(lines):
@@ -72,6 +78,7 @@ def run_read(path: str, limit: int = None) -> str:
         return f"Error: {e}"
 
 def run_write(path: str, content: str) -> str:
+    """Write content to file, creating parent directories if needed."""
     try:
         fp = safe_path(path)
         fp.parent.mkdir(parents=True, exist_ok=True)
@@ -81,6 +88,7 @@ def run_write(path: str, content: str) -> str:
         return f"Error: {e}"
 
 def run_edit(path: str, old_text: str, new_text: str) -> str:
+    """Replace first occurrence of old_text with new_text in a file."""
     try:
         fp = safe_path(path)
         content = fp.read_text()
@@ -100,6 +108,8 @@ TOOL_HANDLERS = {
 }
 
 # Child gets all base tools except task (no recursive spawning)
+# The subagent doesn't get the "task" tool - it can't spawn its own sub-subagents.
+# This prevents infinite recursion and keeps the hierarchy flat.
 CHILD_TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
      "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
@@ -113,28 +123,84 @@ CHILD_TOOLS = [
 
 
 # -- Subagent: fresh context, filtered tools, summary-only return --
+# The subagent runs in its own loop with:
+#   - Fresh message history (starts empty, receives only the prompt)
+#   - Filtered tools (no task tool - can't spawn more subagents)
+#   - Returns only the final text summary to the parent
+#
+# Why fresh context?
+#   - Keeps parent messages clean (no subagent noise)
+#   - Subagent doesn't need parent's conversation history
+#   - Each subagent starts with a clean slate
+#
+# How it returns to parent:
+#   - Extracts text blocks from final response
+#   - Joins them into a single string
+#   - This string becomes the tool_result content for the parent
+#
 def run_subagent(prompt: str) -> str:
-    sub_messages = [{"role": "user", "content": prompt}]  # fresh context
-    for _ in range(30):  # safety limit
+    """
+    Spawn a subagent to handle a subtask.
+    
+    Args:
+        prompt: The task description from the parent LLM
+        
+    Returns:
+        A summary string that the parent can read
+        
+    Flow:
+        1. Create fresh sub_messages with prompt as first user message
+        2. Run agent loop (up to 30 rounds) in subagent's context
+        3. Extract text from final response
+        4. Return only the text summary to parent
+    """
+    # Step 1: Fresh context - starts with only the user's prompt
+    # This is the key difference from parent - no accumulated history
+    sub_messages = [{"role": "user", "content": prompt}]
+    
+    # Step 2: Run agent loop in subagent's context
+    for _ in range(30):  # safety limit to prevent infinite loops
+        # Call LLM with subagent's system prompt and its own message history
         response = client.messages.create(
             model=MODEL, system=SUBAGENT_SYSTEM, messages=sub_messages,
             tools=CHILD_TOOLS, max_tokens=8000,
         )
+        
+        # Append LLM's response to subagent's history (standard pattern)
         sub_messages.append({"role": "assistant", "content": response.content})
+        
+        # If LLM didn't call any tools, it's done - break early
         if response.stop_reason != "tool_use":
             break
+        
+        # Execute tool calls in subagent's context
         results = []
         for block in response.content:
             if block.type == "tool_use":
+                # Look up handler (bash, read_file, write_file, edit_file)
                 handler = TOOL_HANDLERS.get(block.name)
                 output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+                # Truncate output to 50k chars to prevent huge context
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)[:50000]})
+        
+        # Append tool results to subagent's history for next turn
         sub_messages.append({"role": "user", "content": results})
-    # Only the final text returns to the parent -- child context is discarded
+    
+    # Step 3: Extract and return only the final text summary
+    # The subagent's context is discarded - only text returns to parent
+    # This keeps the parent's message history clean
     return "".join(b.text for b in response.content if hasattr(b, "text")) or "(no summary)"
 
 
 # -- Parent tools: base tools + task dispatcher --
+# Parent gets all child tools PLUS the "task" tool for spawning subagents.
+# This is the key difference: parent can delegate, child cannot.
+#
+# The "task" tool:
+#   - prompt: The task description to give subagent
+#   - description: Optional short label (shown in logs)
+#   - When called, runs run_subagent(prompt) which creates fresh context
+#
 PARENT_TOOLS = CHILD_TOOLS + [
     {"name": "task", "description": "Spawn a subagent with fresh context. It shares the filesystem but not conversation history.",
      "input_schema": {"type": "object", "properties": {"prompt": {"type": "string"}, "description": {"type": "string", "description": "Short description of the task"}}, "required": ["prompt"]}},
@@ -142,26 +208,59 @@ PARENT_TOOLS = CHILD_TOOLS + [
 
 
 def agent_loop(messages: list):
+    """
+    Parent agent loop with task dispatch capability.
+    
+    Key difference from s02/s03:
+    - PARENT_TOOLS includes the "task" tool
+    - When LLM calls task, spawn a subagent with fresh context
+    - Subagent runs independently, returns only a summary
+    
+    How task dispatch works:
+        1. LLM calls task tool: block.name == "task"
+        2. Extract prompt from block.input["prompt"]
+        3. Call run_subagent(prompt) - this creates fresh sub_messages
+        4. Subagent runs its own loop until done
+        5. Return value becomes tool_result content for the parent
+    """
     while True:
+        # Call LLM with parent's messages and tools (including task)
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
             tools=PARENT_TOOLS, max_tokens=8000,
         )
         messages.append({"role": "assistant", "content": response.content})
+        
+        # If LLM didn't call a tool, we're done
         if response.stop_reason != "tool_use":
             return
+        
+        # Process each tool call
         results = []
         for block in response.content:
             if block.type == "tool_use":
+                # Check if this is a task dispatch (spawn subagent)
                 if block.name == "task":
+                    # Get description for logging (defaults to "subtask")
                     desc = block.input.get("description", "subtask")
                     print(f"> task ({desc}): {block.input['prompt'][:80]}")
+                    
+                    # Spawn subagent with the given prompt
+                    # This runs in fresh context, returns only summary
                     output = run_subagent(block.input["prompt"])
                 else:
+                    # Regular tool call - execute in parent's context
                     handler = TOOL_HANDLERS.get(block.name)
                     output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+                
+                # Print result preview
                 print(f"  {str(output)[:200]}")
+                
+                # Build tool_result for next turn
+                # For task tool, this is the subagent's summary text
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
+        
+        # Append all tool results as user message to continue loop
         messages.append({"role": "user", "content": results})
 
 
