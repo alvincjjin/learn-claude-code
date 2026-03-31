@@ -154,7 +154,7 @@ def run_subagent(prompt: str) -> str:
         3. Extract text from final response
         4. Return only the text summary to parent
     """
-    # Step 1: Fresh context - starts with only the user's prompt
+    # Step 1: Fresh context - starts with only the prompt from the parent as the first user message
     # This is the key difference from parent - no accumulated history
     sub_messages = [{"role": "user", "content": prompt}]
     

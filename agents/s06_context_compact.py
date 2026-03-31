@@ -54,28 +54,65 @@ MODEL = os.environ["MODEL_ID"]
 
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use tools to solve tasks."
 
-THRESHOLD = 50000
-TRANSCRIPT_DIR = WORKDIR / ".transcripts"
-KEEP_RECENT = 3
+THRESHOLD = 50000  # Token count threshold to trigger auto_compact
+TRANSCRIPT_DIR = WORKDIR / ".transcripts"  # Where to save full conversation logs
+KEEP_RECENT = 3  # How many recent tool_results to keep (not compress)
 
 
 def estimate_tokens(messages: list) -> int:
-    """Rough token count: ~4 chars per token."""
+    """
+    Rough token estimation.
+    
+    Uses character count / 4 as a rough approximation.
+    Not exact but good enough for triggering compression.
+    
+    Note: This is a simplified estimation. Real tokenization varies
+    by model and content type (code uses more tokens than text).
+    """
     return len(str(messages)) // 4
 
 
 # -- Layer 1: micro_compact - replace old tool results with placeholders --
+# This runs on EVERY turn, silently compressing old tool outputs.
+#
+# Problem: Tool outputs can be huge (reading large files, bash output).
+# Solution: Keep only last 3 results, replace older ones with short placeholders.
+#
+# Example:
+#   Before:  [{"type": "tool_result", "content": "500 lines of file content..."}]
+#   After:   [{"type": "tool_result", "content": "[Previous: used read_file]"}]
+#
+# Why > 100 chars? Only compress if there's actually savings.
+# Short outputs like "Error: file not found" don't waste much context.
+#
 def micro_compact(messages: list) -> list:
-    # Collect (msg_index, part_index, tool_result_dict) for all tool_result entries
+    """
+    Silently compress old tool results on every turn.
+    
+    Algorithm:
+        1. Find all tool_result entries in message history
+        2. Build a map from tool_use_id -> tool_name (by looking at prior assistant messages)
+        3. Keep last KEEP_RECENT (3) tool results as-is
+        4. Replace older tool_results (>100 chars) with "[Previous: used {tool_name}]"
+    
+    This is "micro" because it's lightweight and runs every turn.
+    """
+    # Step 1: Collect all tool_result entries from user messages
+    # Each entry is (message_index, part_index, tool_result_dict)
     tool_results = []
     for msg_idx, msg in enumerate(messages):
         if msg["role"] == "user" and isinstance(msg.get("content"), list):
             for part_idx, part in enumerate(msg["content"]):
                 if isinstance(part, dict) and part.get("type") == "tool_result":
                     tool_results.append((msg_idx, part_idx, part))
+    
+    # Step 2: Nothing to compress if we have KEEP_RECENT or fewer
     if len(tool_results) <= KEEP_RECENT:
         return messages
-    # Find tool_name for each result by matching tool_use_id in prior assistant messages
+    
+    # Step 3: Build a map from tool_use_id to tool_name
+    # We need this because tool_result only has tool_use_id, not the tool name
+    # Example: tool_result.tool_use_id="toolu_abc123" -> tool_name="read_file"
     tool_name_map = {}
     for msg in messages:
         if msg["role"] == "assistant":
@@ -84,9 +121,12 @@ def micro_compact(messages: list) -> list:
                 for block in content:
                     if hasattr(block, "type") and block.type == "tool_use":
                         tool_name_map[block.id] = block.name
-    # Clear old results (keep last KEEP_RECENT)
+    
+    # Step 4: Replace old tool results with placeholders
+    # to_clear = all tool_results EXCEPT the last 3 (most recent)
     to_clear = tool_results[:-KEEP_RECENT]
     for _, _, result in to_clear:
+        # Only compress if content is longer than 100 chars (worth compressing)
         if isinstance(result.get("content"), str) and len(result["content"]) > 100:
             tool_id = result.get("tool_use_id", "")
             tool_name = tool_name_map.get(tool_id, "unknown")
@@ -95,15 +135,43 @@ def micro_compact(messages: list) -> list:
 
 
 # -- Layer 2: auto_compact - save transcript, summarize, replace messages --
+# This runs when token count exceeds THRESHOLD (50000 tokens).
+#
+# Problem: Even with micro_compact, context grows over time.
+# Solution: Save full transcript to disk, ask LLM to summarize, replace all messages.
+#
+# Flow:
+#   1. Save full conversation to .transcripts/transcript_<timestamp>.jsonl
+#   2. Send conversation to LLM with summarize prompt
+#   3. LLM returns summary with key info (accomplishments, current state, decisions)
+#   4. Replace ALL messages with just 2: user message with summary + assistant acknowledgment
+#
+# Why save transcript? In case we need to reference old details later.
+# The summary points to the transcript file for full details.
+#
 def auto_compact(messages: list) -> list:
-    # Save full transcript to disk
+    """
+    Full conversation compression when context gets too large.
+    
+    Steps:
+        1. Save full transcript to .transcripts/ directory
+        2. Call LLM to summarize the conversation
+        3. Replace all messages with compressed summary
+    
+    Returns:
+        A new 2-message conversation: [user message with summary, assistant acknowledgment]
+    """
+    # Step 1: Save full transcript to disk
+    # Each message becomes a JSON line for potential later reference
     TRANSCRIPT_DIR.mkdir(exist_ok=True)
     transcript_path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
     with open(transcript_path, "w") as f:
         for msg in messages:
             f.write(json.dumps(msg, default=str) + "\n")
     print(f"[transcript saved: {transcript_path}]")
-    # Ask LLM to summarize
+    
+    # Step 2: Ask LLM to summarize the conversation
+    # We limit to 80k chars to avoid sending huge context to the summarizer
     conversation_text = json.dumps(messages, default=str)[:80000]
     response = client.messages.create(
         model=MODEL,
@@ -114,10 +182,12 @@ def auto_compact(messages: list) -> list:
         max_tokens=2000,
     )
     summary = response.content[0].text
-    # Replace all messages with compressed summary
+    
+    # Step 3: Replace all messages with just the summary
+    # Only return the user message - Anthropic API requires ending with user message only
+    # (no assistant prefill allowed)
     return [
         {"role": "user", "content": f"[Conversation compressed. Transcript: {transcript_path}]\n\n{summary}"},
-        {"role": "assistant", "content": "Understood. I have the context from the summary. Continuing."},
     ]
 
 
@@ -193,28 +263,54 @@ TOOLS = [
 
 
 def agent_loop(messages: list):
+    """
+    Agent loop with three-layer compression pipeline.
+    
+    Three layers work together:
+        - Layer 1 (micro_compact): Runs every turn, silently compresses old tool outputs
+        - Layer 2 (auto_compact): Runs when tokens > 50000, summarizes conversation
+        - Layer 3 (manual compact): Runs when model explicitly calls compact tool
+    
+    Compression flow per turn:
+        1. micro_compact() - replace old tool results with placeholders
+        2. Check token count - if > 50000, trigger auto_compact
+        3. Call LLM with compressed messages
+        4. Execute tools
+        5. If model called compact tool, trigger manual compression
+    """
     while True:
-        # Layer 1: micro_compact before each LLM call
+        # Layer 1: micro_compact runs before EVERY LLM call
+        # This silently compresses old tool outputs (keeps last 3, replaces older)
         micro_compact(messages)
-        # Layer 2: auto_compact if token estimate exceeds threshold
+        
+        # Layer 2: auto_compact triggers when context gets too large
+        # If estimated tokens > THRESHOLD (50000), summarize and compress
         if estimate_tokens(messages) > THRESHOLD:
             print("[auto_compact triggered]")
             messages[:] = auto_compact(messages)
+        
+        # Call LLM with (now compressed) message history
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
             tools=TOOLS, max_tokens=8000,
         )
         messages.append({"role": "assistant", "content": response.content})
+        
+        # If LLM didn't call any tools, we're done
         if response.stop_reason != "tool_use":
             return
+        
+        # Execute tool calls
         results = []
-        manual_compact = False
+        manual_compact = False  # Track if model called compact tool
         for block in response.content:
             if block.type == "tool_use":
                 if block.name == "compact":
+                    # Layer 3: Manual compact - model explicitly requested compression
                     manual_compact = True
                     output = "Compressing..."
                 else:
+                    # Regular tool - execute it
                     handler = TOOL_HANDLERS.get(block.name)
                     try:
                         output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
@@ -222,8 +318,12 @@ def agent_loop(messages: list):
                         output = f"Error: {e}"
                 print(f"> {block.name}: {str(output)[:200]}")
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
+        
+        # Append tool results as user message to continue loop
         messages.append({"role": "user", "content": results})
-        # Layer 3: manual compact triggered by the compact tool
+        
+        # Layer 3: Manual compact triggered by model calling compact tool
+        # This is the same as auto_compact but explicitly requested by the model
         if manual_compact:
             print("[manual compact]")
             messages[:] = auto_compact(messages)
