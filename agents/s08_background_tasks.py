@@ -46,7 +46,31 @@ MODEL = os.environ["MODEL_ID"]
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use background_run for long-running commands."
 
 
-# -- BackgroundManager: threaded execution + notification queue --
+# =============================================================================
+# BackgroundManager: threaded execution + notification queue
+# =============================================================================
+#
+# PROBLEM: Long-running commands block the agent loop, wasting LLM time.
+# SOLUTION: Run commands in background threads, inject results via queue.
+#
+# Flow:
+#   1. Agent calls background_run("npm test")
+#   2. background_run spawns thread, returns task_id immediately
+#   3. Agent continues with other work (can call more tools)
+#   4. When background task completes, result goes to notification queue
+#   5. Next LLM call drains queue, injects results as user message
+#   6. Agent sees results and can react accordingly
+#
+# Why separate queue?
+#   - Can't inject results mid-LLM-call (Anthropic requirement)
+#   - Must wait for next turn to deliver notifications
+#   - This ensures proper message ordering
+#
+# Thread safety:
+#   - _lock protects shared state (_notification_queue, tasks dict)
+#   - daemon=True means threads don't prevent program exit
+#   - subprocess runs in separate OS process, bypassing GIL -> true parallelism
+#
 class BackgroundManager:
     def __init__(self):
         self.tasks = {}  # task_id -> {status, result, command}
@@ -54,7 +78,15 @@ class BackgroundManager:
         self._lock = threading.Lock()
 
     def run(self, command: str) -> str:
-        """Start a background thread, return task_id immediately."""
+        """
+        Start a background thread, return task_id immediately.
+        
+        The command runs in a separate thread while agent continues.
+        Use check_background to monitor status.
+        
+        Returns:
+            String with task_id and command preview
+        """
         task_id = str(uuid.uuid4())[:8]
         self.tasks[task_id] = {"status": "running", "result": None, "command": command}
         thread = threading.Thread(
@@ -64,7 +96,12 @@ class BackgroundManager:
         return f"Background task {task_id} started: {command[:80]}"
 
     def _execute(self, task_id: str, command: str):
-        """Thread target: run subprocess, capture output, push to queue."""
+        """
+        Thread target: run subprocess, capture output, push to queue.
+        
+        Runs in background thread - cannot block main agent loop.
+        On completion, pushes notification to queue for next turn.
+        """
         try:
             r = subprocess.run(
                 command, shell=True, cwd=WORKDIR,
@@ -78,47 +115,70 @@ class BackgroundManager:
         except Exception as e:
             output = f"Error: {e}"
             status = "error"
+        
+        # Update task status with result
         self.tasks[task_id]["status"] = status
         self.tasks[task_id]["result"] = output or "(no output)"
+        
+        # Push notification to queue (protected by lock)
         with self._lock:
             self._notification_queue.append({
                 "task_id": task_id,
                 "status": status,
                 "command": command[:80],
-                "result": (output or "(no output)")[:500],
+                "result": (output or "(no output)")[:500],  # Truncate for message
             })
 
     def check(self, task_id: str = None) -> str:
-        """Check status of one task or list all."""
+        """
+        Check status of one task or list all.
+        
+        Args:
+            task_id: Optional specific task to check
+            
+        Returns:
+            Status string for one task or all tasks
+        """
         if task_id:
             t = self.tasks.get(task_id)
             if not t:
                 return f"Error: Unknown task {task_id}"
             return f"[{t['status']}] {t['command'][:60]}\n{t.get('result') or '(running)'}"
+        
         lines = []
         for tid, t in self.tasks.items():
             lines.append(f"{tid}: [{t['status']}] {t['command'][:60]}")
         return "\n".join(lines) if lines else "No background tasks."
 
     def drain_notifications(self) -> list:
-        """Return and clear all pending completion notifications."""
+        """
+        Return and clear all pending completion notifications.
+        
+        Called before each LLM call to deliver background task results.
+        Clears the queue after returning to avoid duplicate notifications.
+        """
         with self._lock:
             notifs = list(self._notification_queue)
             self._notification_queue.clear()
         return notifs
 
 
+# Global background manager instance
 BG = BackgroundManager()
 
 
-# -- Tool implementations --
+# =============================================================================
+# Tool implementations (same as other agents)
+# =============================================================================
 def safe_path(p: str) -> Path:
+    """Validate path stays within workspace."""
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
         raise ValueError(f"Path escapes workspace: {p}")
     return path
 
 def run_bash(command: str) -> str:
+    """Execute shell command with safety checks."""
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(d in command for d in dangerous):
         return "Error: Dangerous command blocked"
@@ -131,6 +191,7 @@ def run_bash(command: str) -> str:
         return "Error: Timeout (120s)"
 
 def run_read(path: str, limit: int = None) -> str:
+    """Read file contents with optional line limit."""
     try:
         lines = safe_path(path).read_text().splitlines()
         if limit and limit < len(lines):
@@ -140,6 +201,7 @@ def run_read(path: str, limit: int = None) -> str:
         return f"Error: {e}"
 
 def run_write(path: str, content: str) -> str:
+    """Write content to file, creating directories as needed."""
     try:
         fp = safe_path(path)
         fp.parent.mkdir(parents=True, exist_ok=True)
@@ -149,6 +211,7 @@ def run_write(path: str, content: str) -> str:
         return f"Error: {e}"
 
 def run_edit(path: str, old_text: str, new_text: str) -> str:
+    """Replace exact text in file."""
     try:
         fp = safe_path(path)
         c = fp.read_text()
@@ -160,6 +223,14 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
         return f"Error: {e}"
 
 
+# =============================================================================
+# Tool definitions for the agent
+# =============================================================================
+#
+# Tools unique to s08:
+#   - background_run: Spawn background thread, return task_id immediately
+#   - check_background: Check task status or list all tasks
+#
 TOOL_HANDLERS = {
     "bash":             lambda **kw: run_bash(kw["command"]),
     "read_file":        lambda **kw: run_read(kw["path"], kw.get("limit")),
@@ -169,6 +240,9 @@ TOOL_HANDLERS = {
     "check_background": lambda **kw: BG.check(kw.get("task_id")),
 }
 
+
+# Tool schemas define inputs the LLM can use to call each tool.
+#
 TOOLS = [
     {"name": "bash", "description": "Run a shell command (blocking).",
      "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
@@ -185,23 +259,57 @@ TOOLS = [
 ]
 
 
+# =============================================================================
+# Agent loop - handles tool calls and background notifications
+# =============================================================================
+#
+# Key difference from other agents:
+#   - Before each LLM call, drain notification queue
+#   - Inject background results as user message
+#   - Add assistant acknowledgment to maintain message alternation
+#
+# Message flow with background tasks (concrete example):
+#   Turn 1:
+#     User: "Run npm test"
+#     Agent: calls background_run("npm test") -> returns task_abc started
+#   Turn 2:
+#     User: "Check status"
+#     Agent: calls check_background(task_abc) -> returns "running"
+#   [time passes - tests complete in background]
+#   Turn 3 (next user input):
+#     Before LLM call: drain_notifications() finds completed task
+#     Injects: <background-results>[task_abc: completed: 15 passed]</background-results>
+#     Agent: sees results in context -> "Tests finished, 15 passed"
+#
 def agent_loop(messages: list):
+    """Main agent loop with background task support."""
     while True:
-        # Drain background notifications and inject as system message before LLM call
+        # Drain background notifications and inject as user message before LLM call
+        #
+        # CRITICAL: Anthropic API requires conversation to end with a user message.
+        # Cannot add assistant prefill here - must let LLM generate the response.
+        # Violation causes: "This model does not support assistant message prefill"
         notifs = BG.drain_notifications()
         if notifs and messages:
             notif_text = "\n".join(
                 f"[bg:{n['task_id']}] {n['status']}: {n['result']}" for n in notifs
             )
             messages.append({"role": "user", "content": f"<background-results>\n{notif_text}\n</background-results>"})
-            messages.append({"role": "assistant", "content": "Noted background results."})
+        
+        # Call LLM with current message history and available tools
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
             tools=TOOLS, max_tokens=8000,
         )
+        
+        # Add assistant response to history
         messages.append({"role": "assistant", "content": response.content})
+        
+        # If LLM didn't call any tools, we're done
         if response.stop_reason != "tool_use":
             return
+        
+        # Execute tool calls and collect results
         results = []
         for block in response.content:
             if block.type == "tool_use":
@@ -210,11 +318,23 @@ def agent_loop(messages: list):
                     output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
                 except Exception as e:
                     output = f"Error: {e}"
+                
                 print(f"> {block.name}: {str(output)[:200]}")
-                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
+                
+                # Build tool_result for the LLM
+                results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": str(output)
+                })
+        
+        # Append tool results as user message to continue conversation
         messages.append({"role": "user", "content": results})
 
 
+# =============================================================================
+# Interactive REPL for testing
+# =============================================================================
 if __name__ == "__main__":
     history = []
     while True:
@@ -224,8 +344,11 @@ if __name__ == "__main__":
             break
         if query.strip().lower() in ("q", "exit", ""):
             break
+        
         history.append({"role": "user", "content": query})
         agent_loop(history)
+        
+        # Print assistant's final response (non-tool text)
         response_content = history[-1]["content"]
         if isinstance(response_content, list):
             for block in response_content:
