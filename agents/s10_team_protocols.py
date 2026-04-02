@@ -3,48 +3,37 @@
 """
 s10_team_protocols.py - Team Protocols
 
-Shutdown protocol and plan approval protocol, both using the same
-request_id correlation pattern. Builds on s09's team messaging.
+Two structured protocols for team coordination, both using request_id correlation:
 
-    Shutdown FSM: pending -> approved | rejected
+1. SHUTDOWN PROTOCOL: Graceful teammate shutdown
+   - Lead sends shutdown_request with request_id
+   - Teammate receives, decides to approve/reject
+   - Teammate sends shutdown_response with same request_id
+   - Status tracked: pending -> approved | rejected
+   - If approved, teammate thread exits, status = "shutdown"
 
-    Lead                              Teammate
-    +---------------------+          +---------------------+
-    | shutdown_request     |          |                     |
-    | {                    | -------> | receives request    |
-    |   request_id: abc    |          | decides: approve?   |
-    | }                    |          |                     |
-    +---------------------+          +---------------------+
-                                             |
-    +---------------------+          +-------v-------------+
-    | shutdown_response    | <------- | shutdown_response   |
-    | {                    |          | {                   |
-    |   request_id: abc    |          |   request_id: abc   |
-    |   approve: true      |          |   approve: true     |
-    | }                    |          | }                   |
-    +---------------------+          +---------------------+
-            |
-            v
-    status -> "shutdown", thread stops
+2. PLAN APPROVAL PROTOCOL: Get approval for major work
+   - Teammate submits plan via plan_approval with request_id
+   - Lead reviews and responds via plan_approval tool
+   - Teammate receives approval/rejection
+   - Status tracked: pending -> approved | rejected
 
-    Plan approval FSM: pending -> approved | rejected
+    Shutdown FSM:
+    +----------+  request   +----------+  response   +----------+
+    |  lead    | --------> | teammate | <---------- |  lead    |
+    +----------+           +----------+              +----------+
+                               |
+                               v
+                         status = shutdown
 
-    Teammate                          Lead
-    +---------------------+          +---------------------+
-    | plan_approval        |          |                     |
-    | submit: {plan:"..."}| -------> | reviews plan text   |
-    +---------------------+          | approve/reject?     |
-                                     +---------------------+
-                                             |
-    +---------------------+          +-------v-------------+
-    | plan_approval_resp   | <------- | plan_approval       |
-    | {approve: true}      |          | review: {req_id,    |
-    +---------------------+          |   approve: true}     |
-                                     +---------------------+
+    Plan FSM:
+    +----------+  submit    +----------+  response   +----------+
+    | teammate | --------> |   lead   | <---------- | teammate |
+    +----------+           +----------+              +----------+
 
-    Trackers: {request_id: {"target|from": name, "status": "pending|..."}}
+Key insight: "Same request_id correlation pattern, two protocols."
 
-Key insight: "Same request_id correlation pattern, two domains."
+Builds on s09: Same MessageBus, TeammateManager, but adds protocol tools.
 """
 
 import json
@@ -70,21 +59,39 @@ INBOX_DIR = TEAM_DIR / "inbox"
 
 SYSTEM = f"You are a team lead at {WORKDIR}. Manage teammates with shutdown and plan approval protocols."
 
+# Valid message types for inter-agent communication
 VALID_MSG_TYPES = {
     "message",
     "broadcast",
-    "shutdown_request",
-    "shutdown_response",
-    "plan_approval_response",
+    "shutdown_request",        # Lead -> teammate: please shut down
+    "shutdown_response",       # Teammate -> lead: approved/rejected
+    "plan_approval_response", # Lead -> teammate: plan approved/rejected
 }
 
-# -- Request trackers: correlate by request_id --
-shutdown_requests = {}
-plan_requests = {}
+
+# =============================================================================
+# Request trackers: correlate requests by request_id
+# =============================================================================
+#
+# Both protocols use request_id to correlate messages:
+#   - Shutdown: lead sends request, teammate responds with same ID
+#   - Plan: teammate submits plan, lead responds with same ID
+#
+# Thread-safe access via _tracker_lock.
+# NOTE: These are IN-MEMORY ONLY - lost on restart. For persistence, write to disk.
+# Format: {request_id: {"target": name, "from": name, "status": "pending|approved|rejected"}}
+
+shutdown_requests = {}  # request_id -> {target, status}
+plan_requests = {}      # request_id -> {from, plan, status}
 _tracker_lock = threading.Lock()
 
 
-# -- MessageBus: JSONL inbox per teammate --
+# =============================================================================
+# MessageBus: JSONL inbox per teammate (same as s09)
+# =============================================================================
+# MessageBus: JSONL inbox per teammate
+# - send() appends JSON to recipient's inbox
+# - read_inbox() reads all lines, then empties file
 class MessageBus:
     def __init__(self, inbox_dir: Path):
         self.dir = inbox_dir
@@ -92,6 +99,7 @@ class MessageBus:
 
     def send(self, sender: str, to: str, content: str,
              msg_type: str = "message", extra: dict = None) -> str:
+        """Send message to a teammate's inbox."""
         if msg_type not in VALID_MSG_TYPES:
             return f"Error: Invalid type '{msg_type}'. Valid: {VALID_MSG_TYPES}"
         msg = {
@@ -108,6 +116,7 @@ class MessageBus:
         return f"Sent {msg_type} to {to}"
 
     def read_inbox(self, name: str) -> list:
+        """Read and drain a teammate's inbox."""
         inbox_path = self.dir / f"{name}.jsonl"
         if not inbox_path.exists():
             return []
@@ -119,6 +128,7 @@ class MessageBus:
         return messages
 
     def broadcast(self, sender: str, content: str, teammates: list) -> str:
+        """Send message to all teammates except sender."""
         count = 0
         for name in teammates:
             if name != sender:
@@ -130,7 +140,15 @@ class MessageBus:
 BUS = MessageBus(INBOX_DIR)
 
 
-# -- TeammateManager with shutdown + plan approval --
+# =============================================================================
+# TeammateManager with shutdown + plan approval (builds on s09)
+# =============================================================================
+#
+# Same as s09, but adds:
+#   - shutdown_response tool: teammate can approve/reject shutdown
+#   - plan_approval tool: teammate can submit plans for approval
+#   - _teammate_loop checks for shutdown approval to exit early
+#
 class TeammateManager:
     def __init__(self, team_dir: Path):
         self.dir = team_dir
@@ -154,6 +172,7 @@ class TeammateManager:
         return None
 
     def spawn(self, name: str, role: str, prompt: str) -> str:
+        """Spawn a persistent teammate."""
         member = self._find_member(name)
         if member:
             if member["status"] not in ("idle", "shutdown"):
@@ -174,6 +193,13 @@ class TeammateManager:
         return f"Spawned '{name}' (role: {role})"
 
     def _teammate_loop(self, name: str, role: str, prompt: str):
+        """
+        Main loop for a persistent teammate.
+        
+        Same as s09, but:
+        - System prompt instructs to use plan_approval and respond to shutdown_request
+        - Checks for shutdown_response approval to exit early
+        """
         sys_prompt = (
             f"You are '{name}', role: {role}, at {WORKDIR}. "
             f"Submit plans via plan_approval before major work. "
@@ -181,13 +207,15 @@ class TeammateManager:
         )
         messages = [{"role": "user", "content": prompt}]
         tools = self._teammate_tools()
-        should_exit = False
+        should_exit = False  # Set to True if shutdown approved
+        
         for _ in range(50):
             inbox = BUS.read_inbox(name)
             for msg in inbox:
                 messages.append({"role": "user", "content": json.dumps(msg)})
             if should_exit:
                 break
+            
             try:
                 response = client.messages.create(
                     model=MODEL,
@@ -198,9 +226,11 @@ class TeammateManager:
                 )
             except Exception:
                 break
+            
             messages.append({"role": "assistant", "content": response.content})
             if response.stop_reason != "tool_use":
                 break
+            
             results = []
             for block in response.content:
                 if block.type == "tool_use":
@@ -211,29 +241,41 @@ class TeammateManager:
                         "tool_use_id": block.id,
                         "content": str(output),
                     })
+                    # Check if shutdown was approved - exit loop
                     if block.name == "shutdown_response" and block.input.get("approve"):
                         should_exit = True
             messages.append({"role": "user", "content": results})
+        
+        # Set status based on exit reason
+        # - should_exit=True (shutdown approved) -> "shutdown"
+        # - otherwise (task done) -> "idle"
         member = self._find_member(name)
         if member:
             member["status"] = "shutdown" if should_exit else "idle"
             self._save_config()
 
     def _exec(self, sender: str, tool_name: str, args: dict) -> str:
-        # these base tools are unchanged from s02
-        if tool_name == "bash":
+        """
+        Execute a tool for a teammate.
+        
+        Includes base tools, communication tools, and protocol tools.
+        Uses dict-based handler pattern for cleaner code.
+        """
+        def _run_bash_cmd():
             return _run_bash(args["command"])
-        if tool_name == "read_file":
+        def _run_read_cmd():
             return _run_read(args["path"])
-        if tool_name == "write_file":
+        def _run_write_cmd():
             return _run_write(args["path"], args["content"])
-        if tool_name == "edit_file":
+        def _run_edit_cmd():
             return _run_edit(args["path"], args["old_text"], args["new_text"])
-        if tool_name == "send_message":
+        def _send_message():
             return BUS.send(sender, args["to"], args["content"], args.get("msg_type", "message"))
-        if tool_name == "read_inbox":
+        def _read_inbox():
             return json.dumps(BUS.read_inbox(sender), indent=2)
-        if tool_name == "shutdown_response":
+        
+        def _shutdown_response():
+            """Handle teammate's response to shutdown request."""
             req_id = args["request_id"]
             approve = args["approve"]
             with _tracker_lock:
@@ -244,7 +286,9 @@ class TeammateManager:
                 "shutdown_response", {"request_id": req_id, "approve": approve},
             )
             return f"Shutdown {'approved' if approve else 'rejected'}"
-        if tool_name == "plan_approval":
+        
+        def _plan_approval():
+            """Submit a plan for lead approval."""
             plan_text = args.get("plan", "")
             req_id = str(uuid.uuid4())[:8]
             with _tracker_lock:
@@ -254,10 +298,34 @@ class TeammateManager:
                 {"request_id": req_id, "plan": plan_text},
             )
             return f"Plan submitted (request_id={req_id}). Waiting for lead approval."
-        return f"Unknown tool: {tool_name}"
+
+        handlers = {
+            "bash": _run_bash_cmd,
+            "read_file": _run_read_cmd,
+            "write_file": _run_write_cmd,
+            "edit_file": _run_edit_cmd,
+            "send_message": _send_message,
+            "read_inbox": _read_inbox,
+            "shutdown_response": _shutdown_response,
+            "plan_approval": _plan_approval,
+        }
+        
+        handler = handlers.get(tool_name)
+        if handler is None:
+            return f"Unknown tool: {tool_name}"
+        try:
+            return handler()
+        except KeyError as e:
+            return f"Missing required argument: {e}"
 
     def _teammate_tools(self) -> list:
-        # these base tools are unchanged from s02
+        """
+        Tools available to teammates.
+        
+        Base: bash, read_file, write_file, edit_file
+        Comm: send_message, read_inbox
+        Protocol: shutdown_response, plan_approval
+        """
         return [
             {"name": "bash", "description": "Run a shell command.",
              "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
@@ -278,6 +346,7 @@ class TeammateManager:
         ]
 
     def list_all(self) -> str:
+        """List all teammates with name, role, status."""
         if not self.config["members"]:
             return "No teammates."
         lines = [f"Team: {self.config['team_name']}"]
@@ -286,13 +355,16 @@ class TeammateManager:
         return "\n".join(lines)
 
     def member_names(self) -> list:
+        """Get list of all teammate names."""
         return [m["name"] for m in self.config["members"]]
 
 
 TEAM = TeammateManager(TEAM_DIR)
 
 
-# -- Base tool implementations (these base tools are unchanged from s02) --
+# =============================================================================
+# Base tool implementations (unchanged from s02)
+# =============================================================================
 def _safe_path(p: str) -> Path:
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
@@ -347,8 +419,24 @@ def _run_edit(path: str, old_text: str, new_text: str) -> str:
         return f"Error: {e}"
 
 
-# -- Lead-specific protocol handlers --
+# =============================================================================
+# Lead-specific protocol handlers
+# =============================================================================
+#
+# These handle the lead's side of protocols.
+#
+
 def handle_shutdown_request(teammate: str) -> str:
+    """
+    Lead initiates shutdown protocol.
+    
+    Flow:
+        1. Generate unique request_id
+        2. Track request in shutdown_requests dict
+        3. Send shutdown_request message to teammate
+    
+    Returns request_id for lead to track status later.
+    """
     req_id = str(uuid.uuid4())[:8]
     with _tracker_lock:
         shutdown_requests[req_id] = {"target": teammate, "status": "pending"}
@@ -360,6 +448,16 @@ def handle_shutdown_request(teammate: str) -> str:
 
 
 def handle_plan_review(request_id: str, approve: bool, feedback: str = "") -> str:
+    """
+    Lead responds to plan approval protocol.
+    
+    Flow:
+        1. Look up plan by request_id
+        2. Update status to approved/rejected
+        3. Send plan_approval_response to teammate
+    
+    Returns status of the approval.
+    """
     with _tracker_lock:
         req = plan_requests.get(request_id)
     if not req:
@@ -374,11 +472,20 @@ def handle_plan_review(request_id: str, approve: bool, feedback: str = "") -> st
 
 
 def _check_shutdown_status(request_id: str) -> str:
+    """Check status of a pending shutdown request."""
     with _tracker_lock:
         return json.dumps(shutdown_requests.get(request_id, {"error": "not found"}))
 
 
-# -- Lead tool dispatch (12 tools) --
+# =============================================================================
+# Lead tool dispatch (12 tools)
+# =============================================================================
+#
+# Tools for the team lead:
+#   - Base: bash, read_file, write_file, edit_file
+#   - Team: spawn_teammate, list_teammates, send_message, read_inbox, broadcast
+#   - Protocol: shutdown_request, shutdown_response (check status), plan_approval
+#
 TOOL_HANDLERS = {
     "bash":              lambda **kw: _run_bash(kw["command"]),
     "read_file":         lambda **kw: _run_read(kw["path"], kw.get("limit")),
@@ -394,7 +501,8 @@ TOOL_HANDLERS = {
     "plan_approval":     lambda **kw: handle_plan_review(kw["request_id"], kw["approve"], kw.get("feedback", "")),
 }
 
-# these base tools are unchanged from s02
+
+# Tool schemas for lead's LLM
 TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
      "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
@@ -423,18 +531,27 @@ TOOLS = [
 ]
 
 
+# =============================================================================
+# Agent loop for team lead
+# =============================================================================
+#
+# Key difference from other agents:
+#   - Before each LLM call, check lead's inbox for messages from teammates
+#   - CRITICAL: Anthropic API requires conversation to end with user message only
+#   - Cannot add assistant prefill (violates API rules)
+#
 def agent_loop(messages: list):
+    """Main agent loop for team lead."""
     while True:
+        # Check lead's inbox for messages from teammates
         inbox = BUS.read_inbox("lead")
         if inbox:
             messages.append({
                 "role": "user",
                 "content": f"<inbox>{json.dumps(inbox, indent=2)}</inbox>",
             })
-            messages.append({
-                "role": "assistant",
-                "content": "Noted inbox messages.",
-            })
+            # CRITICAL: Do NOT add assistant prefill - Anthropic requires ending with user message
+        
         response = client.messages.create(
             model=MODEL,
             system=SYSTEM,
@@ -442,9 +559,12 @@ def agent_loop(messages: list):
             tools=TOOLS,
             max_tokens=8000,
         )
+        
         messages.append({"role": "assistant", "content": response.content})
+        
         if response.stop_reason != "tool_use":
             return
+        
         results = []
         for block in response.content:
             if block.type == "tool_use":
@@ -459,9 +579,13 @@ def agent_loop(messages: list):
                     "tool_use_id": block.id,
                     "content": str(output),
                 })
+        
         messages.append({"role": "user", "content": results})
 
 
+# =============================================================================
+# Interactive REPL for testing
+# =============================================================================
 if __name__ == "__main__":
     history = []
     while True:
@@ -479,6 +603,7 @@ if __name__ == "__main__":
             continue
         history.append({"role": "user", "content": query})
         agent_loop(history)
+        
         response_content = history[-1]["content"]
         if isinstance(response_content, list):
             for block in response_content:
